@@ -14,6 +14,7 @@ interface JiraIssue {
 
 export interface JiraWorklog {
   author: {
+    accountId?: string;
     emailAddress?: string;
     displayName?: string;
   };
@@ -58,34 +59,22 @@ export class JiraService {
 
       const resources = response.data;
       if (!resources || resources.length === 0) {
-        throw new UnauthorizedException(
-          'No accessible Jira resources found for this token',
-        );
+        throw new UnauthorizedException('No accessible Jira resources found for this token');
       }
 
       // Buscar el recurso de tipo 'jira'
-      const jiraResource = resources.find((r) =>
-        r.scopes?.includes('read:jira-work'),
-      );
+      const jiraResource = resources.find((r) => r.scopes?.includes('read:jira-work'));
       if (!jiraResource) {
-        throw new UnauthorizedException(
-          'No Jira resource found with required scopes',
-        );
+        throw new UnauthorizedException('No Jira resource found with required scopes');
       }
 
       return jiraResource.id;
     } catch (error) {
       const httpError = error as HttpError;
-      if (
-        httpError.response?.status === 401 ||
-        httpError.response?.status === 403
-      ) {
+      if (httpError.response?.status === 401 || httpError.response?.status === 403) {
         throw new UnauthorizedException('Invalid or expired access token');
       }
-      console.error(
-        '[Jira Error][getCloudId]',
-        httpError.response?.data || httpError.message,
-      );
+      console.error('[Jira Error][getCloudId]', httpError.response?.data || httpError.message);
       throw new Error(
         `Failed to get cloudId: ${httpError.response?.status} - ${JSON.stringify(
           httpError.response?.data || httpError.message,
@@ -116,11 +105,7 @@ export class JiraService {
    * POST /rest/api/3/search/jql
    * (El anterior /search fue eliminado, retorna 410)
    */
-  async getIssues(
-    jql: string,
-    accessToken: string,
-    cloudId: string,
-  ): Promise<JiraIssue[]> {
+  async getIssues(jql: string, accessToken: string, cloudId: string): Promise<JiraIssue[]> {
     const baseUrl = this.getJiraBaseUrl(cloudId);
     const url = `${baseUrl}/search/jql`;
     //TODO las fechas de from y to estan mal por que con ellas se rompe la request
@@ -139,16 +124,10 @@ export class JiraService {
     } catch (error) {
       console.log('error', error);
       const httpError = error as HttpError;
-      if (
-        httpError.response?.status === 401 ||
-        httpError.response?.status === 403
-      ) {
+      if (httpError.response?.status === 401 || httpError.response?.status === 403) {
         throw new UnauthorizedException('Invalid or expired access token');
       }
-      console.error(
-        '[Jira Error][getIssues]',
-        httpError.response?.data || httpError.message,
-      );
+      console.error('[Jira Error][getIssues]', httpError.response?.data || httpError.message);
       throw new Error(
         `Jira API error (${httpError.response?.status}): ${JSON.stringify(
           httpError.response?.data || httpError.message,
@@ -157,11 +136,7 @@ export class JiraService {
     }
   }
 
-  async getWorklogs(
-    issueKey: string,
-    accessToken: string,
-    cloudId: string,
-  ): Promise<JiraWorklog[]> {
+  async getWorklogs(issueKey: string, accessToken: string, cloudId: string): Promise<JiraWorklog[]> {
     const baseUrl = this.getJiraBaseUrl(cloudId);
     const allWorklogs: JiraWorklog[] = [];
     let startAt = 0;
@@ -185,10 +160,7 @@ export class JiraService {
         allWorklogs.push(...worklogs);
 
         // Si ya obtuvimos todos los worklogs, salir del loop
-        if (
-          allWorklogs.length >= response.data.total ||
-          worklogs.length < maxResults
-        ) {
+        if (allWorklogs.length >= response.data.total || worklogs.length < maxResults) {
           break;
         }
 
@@ -198,16 +170,10 @@ export class JiraService {
       return allWorklogs;
     } catch (error) {
       const httpError = error as HttpError;
-      if (
-        httpError.response?.status === 401 ||
-        httpError.response?.status === 403
-      ) {
+      if (httpError.response?.status === 401 || httpError.response?.status === 403) {
         throw new UnauthorizedException('Invalid or expired access token');
       }
-      console.error(
-        '[Jira Error][getWorklogs]',
-        httpError.response?.data || httpError.message,
-      );
+      console.error('[Jira Error][getWorklogs]', httpError.response?.data || httpError.message);
       return [];
     }
   }
@@ -216,7 +182,7 @@ export class JiraService {
    * Construye el JQL con filtros de fecha si se proporcionan
    */
   private buildJql(baseJql?: string, from?: string, to?: string): string {
-    let jql = baseJql;
+    let jql = baseJql?.trim() || '';
 
     // Si se proporcionan fechas, agregar filtros de fecha
     if (from || to) {
@@ -231,25 +197,26 @@ export class JiraService {
       }
 
       if (dateFilters.length > 0) {
-        jql = `${jql} AND ${dateFilters.join(' AND ')}`;
+        const dateFilterStr = dateFilters.join(' AND ');
+        jql = jql ? `${jql} AND ${dateFilterStr}` : dateFilterStr;
       }
-    } else if (!baseJql) {
+    } else if (!jql) {
       // Si no hay fechas ni JQL personalizado, usar el default de últimos 7 días
-      jql = `${jql} AND updated >= -7d`;
+      jql = 'updated >= -7d';
     }
 
-    jql = `${jql} ORDER BY created DESC`;
+    // Agregar ORDER BY solo si hay contenido
+    if (jql) {
+      jql = `${jql} ORDER BY created DESC`;
+    }
+
     return jql;
   }
 
   /**
    * Filtra un worklog por rango de fechas
    */
-  private isWorklogInDateRange(
-    worklog: JiraWorklog,
-    from?: string,
-    to?: string,
-  ): boolean {
+  private isWorklogInDateRange(worklog: JiraWorklog, from?: string, to?: string): boolean {
     if (!from && !to) return true;
 
     const worklogDate = worklog.started;
@@ -297,7 +264,6 @@ export class JiraService {
         issues: Map<string, { issue: JiraIssue; worklogs: JiraWorklog[] }>;
       }
     > = {};
-    console.log('issues', issues);
     for (const issue of issues) {
       const worklogs = await this.getWorklogs(issue.key, accessToken, cloudId);
       for (const w of worklogs) {
@@ -314,12 +280,7 @@ export class JiraService {
           continue;
         }
 
-        // Si se especifica username, filtrar solo ese usuario
-        if (
-          username &&
-          authorEmail !== username &&
-          w.author.displayName !== username
-        ) {
+        if (username && w.author.accountId !== username) {
           continue;
         }
 
@@ -345,7 +306,6 @@ export class JiraService {
     }
 
     // Formatear respuesta según estructura solicitada
-    console.log('worklogsByUser', worklogsByUser);
     const worklogs = Object.entries(worklogsByUser).map(
       ([user, data]: [
         string,
@@ -356,9 +316,7 @@ export class JiraService {
       ]) => ({
         user,
         hours: (data.seconds / 3600).toFixed(2),
-        worklogs: Array.from(data.issues.values()).flatMap(
-          (item) => item.worklogs,
-        ),
+        worklogs: Array.from(data.issues.values()).flatMap((item) => item.worklogs),
         issues: Array.from(data.issues.values()).map((item) => ({
           ...item.issue,
           fields: {

@@ -32,12 +32,13 @@ export class JiraController {
 
     const accessToken = authorization.substring(7); // Remover "Bearer "
 
-    const { dateFrom, dateTo, username, jql } = body;
+    const { dateFrom, dateTo, username, jql, projectKey } = body;
     return this.jiraService.getHoursByUser(accessToken, {
       jql,
       from: dateFrom,
       to: dateTo,
       username,
+      projectKey,
     });
   }
 }

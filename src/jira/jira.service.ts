@@ -333,8 +333,9 @@ export class JiraService {
   }
 
   /**
-   * Obtiene issues dividiendo el rango de fechas en sub-rangos para evitar el límite de 50 issues
-   * Divide el rango en períodos de 7 días para asegurar que obtengamos todos los issues
+   * Obtiene issues dividiendo el rango de fechas en consultas individuales por día
+   * Estrategia: Hacer una consulta por cada día del rango (from=to=día) y luego unir resultados
+   * Esto evita el límite de 50 issues y garantiza que obtengamos todos los issues
    */
   private async getIssuesWithDateRangeSplit(
     baseJql: string | undefined,
@@ -347,30 +348,28 @@ export class JiraService {
     const allIssues: JiraIssue[] = [];
     const uniqueIssueKeys = new Set<string>();
 
-    // Dividir el rango en sub-rangos de 1 día para evitar perder issues
-    // Si una semana tiene 50 issues, con 1 día por sub-rango deberíamos obtener todos
-    const daysPerChunk = 1;
+    // Convertir fechas a objetos Date para iterar día por día
     const fromDate = new Date(from);
     const toDate = new Date(to);
-    let currentDate = new Date(fromDate);
+    const currentDate = new Date(fromDate);
 
-    console.log(`[getIssuesWithDateRangeSplit] Dividiendo rango ${from} a ${to} en sub-rangos de ${daysPerChunk} días`);
+    console.log(`[getIssuesWithDateRangeSplit] Dividiendo rango ${from} a ${to} en consultas individuales por día`);
 
+    // Iterar día por día desde 'from' hasta 'to' (inclusive)
     while (currentDate <= toDate) {
-      // Calcular el fin de este sub-rango (7 días después, o hasta 'to')
-      const chunkEndDate = new Date(currentDate);
-      chunkEndDate.setDate(chunkEndDate.getDate() + daysPerChunk);
-      const chunkEnd = chunkEndDate > toDate ? to : chunkEndDate.toISOString().split('T')[0];
-      const chunkStart = currentDate.toISOString().split('T')[0];
+      const dateStr = currentDate.toISOString().split('T')[0]; // YYYY-MM-DD
 
-      console.log(`[getIssuesWithDateRangeSplit] Buscando sub-rango: ${chunkStart} a ${chunkEnd}`);
+      console.log(`[getIssuesWithDateRangeSplit] Consultando día: ${dateStr}`);
 
-      // Construir JQL para este sub-rango sin expandir el rango de worklogDate
-      // para evitar solapamientos entre sub-rangos
-      const jql = this.buildJql(baseJql, chunkStart, chunkEnd, projectKey, false);
+      // Construir JQL para este día específico (from=to=mismo día)
+      // Usamos expandWorklogDateRange=false para no expandir el rango
+      const jql = this.buildJql(baseJql, dateStr, dateStr, projectKey, false);
 
-      // Obtener issues de este sub-rango
+      // Obtener issues de este día
       const issues = await this.getIssues(jql, accessToken, cloudId);
+
+      // Contar cuántos son nuevos antes de agregarlos
+      const newIssuesCount = issues.filter((issue) => !uniqueIssueKeys.has(issue.key)).length;
 
       // Agregar solo issues únicos (por key) para evitar duplicados
       for (const issue of issues) {
@@ -381,12 +380,11 @@ export class JiraService {
       }
 
       console.log(
-        `[getIssuesWithDateRangeSplit] Sub-rango ${chunkStart} a ${chunkEnd}: ${issues.length} issues nuevos, total acumulado: ${allIssues.length}`,
+        `[getIssuesWithDateRangeSplit] Día ${dateStr}: ${issues.length} issues encontrados, ${newIssuesCount} nuevos, total acumulado: ${allIssues.length}`,
       );
 
-      // Avanzar al siguiente sub-rango
-      currentDate = new Date(chunkEndDate);
-      currentDate.setDate(currentDate.getDate() + 1); // Empezar el día siguiente para evitar solapamientos
+      // Avanzar al día siguiente
+      currentDate.setDate(currentDate.getDate() + 1);
     }
 
     console.log(`[getIssuesWithDateRangeSplit] Total de issues únicos obtenidos: ${allIssues.length}`);

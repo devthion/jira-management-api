@@ -244,21 +244,20 @@ export class JiraService {
         }
       }
 
-      // IMPORTANTE: Limitar por fecha de creación del issue para evitar traer issues muy antiguos
-      // Usamos 3 meses antes de la fecha "from" como límite (o 3 meses desde hoy si no hay "from")
+      // Límite de antigüedad del issue (created): incluir issues creados hasta 1 año antes del rango
+      // Así entran tareas viejas (ej. SS-19 creada en oct) que tienen worklogs recientes en el rango
       const today = new Date().toISOString().split('T')[0];
-      const threeMonthsInDays = 90; // 3 meses
+      const issueCreatedLookbackDays = 365; // 1 año
       const createdLimit = from
-        ? this.subtractDays(from, threeMonthsInDays) // Issues creados máximo 3 meses antes del rango
-        : this.subtractDays(today, threeMonthsInDays); // Últimos 3 meses si no hay from
+        ? this.subtractDays(from, issueCreatedLookbackDays)
+        : this.subtractDays(today, issueCreatedLookbackDays);
       filters.push(`created >= "${createdLimit}"`);
     } else if (!jql) {
-      // Si no hay fechas ni JQL personalizado, usar el default de últimos 30 días de worklog
-      // y limitar a issues creados en los últimos 3 meses
+      // Si no hay fechas ni JQL personalizado: últimos 30 días de worklog, issues creados en el último año
       const today = new Date().toISOString().split('T')[0];
-      const threeMonthsAgo = this.subtractDays(today, 90);
+      const oneYearAgo = this.subtractDays(today, 365);
       filters.push('worklogDate >= -30d');
-      filters.push(`created >= "${threeMonthsAgo}"`);
+      filters.push(`created >= "${oneYearAgo}"`);
     }
 
     // Combinar todos los filtros
@@ -273,6 +272,23 @@ export class JiraService {
     }
 
     return jql;
+  }
+
+  /**
+   * Normaliza una fecha a YYYY-MM-DD. Acepta:
+   * - YYYY-MM-DD (se devuelve igual)
+   * - DD-MM-YYYY o DD/MM/YYYY (europeo) → se convierte a YYYY-MM-DD
+   */
+  private normalizeToYYYYMMDD(dateStr: string | undefined): string | undefined {
+    if (!dateStr || typeof dateStr !== 'string') return dateStr;
+    const trimmed = dateStr.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+    const parts = trimmed.split(/[-/]/);
+    if (parts.length === 3 && parts[0].length <= 2 && parts[1].length <= 2 && parts[2].length === 4) {
+      const [d, m, y] = parts;
+      return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+    }
+    return trimmed;
   }
 
   /**
@@ -307,9 +323,6 @@ export class JiraService {
    * Estrategia: Hacer una consulta por cada día del rango (from=to=día) y luego unir resultados
    * Esto evita el límite de 50 issues y garantiza que obtengamos todos los issues
    */
-  /** Límite de issues por request de la API Jira (sin paginación) */
-  private static readonly JIRA_SEARCH_MAX_RESULTS = 50;
-
   /**
    * Días extra al buscar issues por rango (hacia atrás y hacia adelante).
    * Jira filtra worklogDate por fecha de CREACIÓN del worklog; nosotros mostramos por STARTED (fecha trabajada).
@@ -334,16 +347,10 @@ export class JiraService {
     const effectiveFrom = this.subtractDays(from, JiraService.WORKLOG_DATE_RANGE_LOOKBACK_DAYS);
     const effectiveTo = this.addDays(to, JiraService.WORKLOG_DATE_RANGE_LOOKBACK_DAYS);
     let dateStr = effectiveFrom;
-    const daysQueried: string[] = [];
-    const issuesPerDay: Record<string, number> = {};
 
     while (dateStr <= effectiveTo) {
-      daysQueried.push(dateStr);
-
       const jql = this.buildJql(baseJql, dateStr, dateStr, projectKey, false, username);
       const issues = await this.getIssues(jql, accessToken, cloudId);
-
-      issuesPerDay[dateStr] = issues.length;
 
       for (const issue of issues) {
         if (!uniqueIssueKeys.has(issue.key)) {
@@ -354,14 +361,6 @@ export class JiraService {
 
       if (dateStr === effectiveTo) break;
       dateStr = this.nextDay(dateStr);
-    }
-
-    // Debug: resumen para entender por qué faltan worklogs según el rango
-    const daysAtLimit = daysQueried.filter((d) => issuesPerDay[d] >= JiraService.JIRA_SEARCH_MAX_RESULTS);
-    if (daysAtLimit.length > 0) {
-      console.error(
-        `[getIssuesWithDateRangeSplit] Rango ${from}→${to}: ${allIssues.length} issues únicos. Días que devolvieron el límite (${JiraService.JIRA_SEARCH_MAX_RESULTS}): [${daysAtLimit.join(', ')}]. Si un worklog está en uno de esos días pero el issue no entró en los primeros 50, no aparecerá.`,
-      );
     }
 
     return allIssues;
@@ -400,8 +399,10 @@ export class JiraService {
       projectKey?: string;
     } = {},
   ) {
-    const { jql: baseJql, from, to, username } = options;
-    let { projectKey } = options;
+    const { jql: baseJql, username } = options;
+    let { from, to, projectKey } = options;
+    from = this.normalizeToYYYYMMDD(from);
+    to = this.normalizeToYYYYMMDD(to);
 
     // Corregir projectKey si viene como string "undefined"
     if (projectKey === 'undefined' || projectKey === undefined) {
@@ -459,15 +460,6 @@ export class JiraService {
       }
     }
 
-    // Debug: lo que trae Jira (sin filtrar) — fechas "started" = día trabajado
-    const jiraRaw: Array<{ issue: string; worklogs: Array<{ started: string; created?: string }> }> = [];
-    for (const issue of issues) {
-      const wl = worklogsByIssue.get(issue.key) || [];
-      jiraRaw.push({
-        issue: issue.key,
-        worklogs: wl.map((w) => ({ started: w.started ?? '-', created: w.created })),
-      });
-    }
     // Agrupar worklogs por usuario y por issue
     const worklogsByUser: Record<
       string,

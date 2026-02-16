@@ -106,9 +106,9 @@ export class JiraService {
   }
 
   /**
-   * Usa el endpoint POST /rest/api/3/search/jql
-   * IMPORTANTE: Este endpoint NO soporta paginación - siempre devuelve los primeros ~50 issues
-   * Por eso usamos la estrategia de dividir rangos de fechas para obtener todos los issues
+   * Obtiene issues por JQL. Usa POST /rest/api/3/search/jql (único endpoint disponible).
+   * Este endpoint NO soporta paginación: devuelve como máximo ~50 issues por request.
+   * Por eso dividimos el rango en días (getIssuesWithDateRangeSplit) para obtener más issues.
    */
   async getIssues(jql: string, accessToken: string, cloudId: string): Promise<JiraIssue[]> {
     const baseUrl = this.getJiraBaseUrl(cloudId);
@@ -126,11 +126,8 @@ export class JiraService {
         ),
       );
 
-      const issues = response.data.issues || [];
-
-      return issues;
+      return response.data.issues || [];
     } catch (error) {
-      console.log('error', error);
       const httpError = error as HttpError;
       if (httpError.response?.status === 401 || httpError.response?.status === 403) {
         throw new UnauthorizedException('Invalid or expired access token');
@@ -211,29 +208,14 @@ export class JiraService {
     let jql = baseJql?.trim() || '';
     const filters: string[] = [];
 
-    console.log(
-      `[buildJql] Input: baseJql="${baseJql}", projectKey="${projectKey}", from="${from}", to="${to}", username="${username}"`,
-    );
-
     // Si se proporciona username, filtrar por worklogAuthor en el JQL
-    // Esto optimiza la consulta evitando traer issues de otros usuarios
     if (username && username !== 'undefined') {
-      // worklogAuthor puede usar accountId directamente
       filters.push(`worklogAuthor = ${username}`);
-      console.log(`[buildJql] Agregando filtro de usuario: worklogAuthor = ${username}`);
     }
 
     // Si se proporciona projectKey y no está en el JQL base, agregarlo
-    // Validar que no sea "undefined" como string
     if (projectKey && projectKey !== 'undefined' && !jql.toLowerCase().includes('project')) {
       filters.push(`project = ${projectKey}`);
-      console.log(`[buildJql] Agregando filtro de proyecto: project = ${projectKey}`);
-    } else if (projectKey && projectKey !== 'undefined' && jql.toLowerCase().includes('project')) {
-      console.log(`[buildJql] El proyecto ya está en el JQL base, no se agrega duplicado`);
-    } else if (!projectKey || projectKey === 'undefined') {
-      console.warn(
-        `[buildJql] ADVERTENCIA: No se proporcionó projectKey válido, el JQL puede traer issues de todos los proyectos`,
-      );
     }
 
     // Si se proporcionan fechas, agregar filtros de worklogDate
@@ -290,7 +272,6 @@ export class JiraService {
       jql = `${jql} ORDER BY created DESC`;
     }
 
-    console.log(`[buildJql] JQL final generado: ${jql}`);
     return jql;
   }
 
@@ -313,10 +294,30 @@ export class JiraService {
   }
 
   /**
+   * Devuelve el día siguiente en YYYY-MM-DD (evita bugs de timezone al iterar)
+   */
+  private nextDay(dateStr: string): string {
+    const d = new Date(dateStr + 'T12:00:00.000Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().split('T')[0];
+  }
+
+  /**
    * Obtiene issues dividiendo el rango de fechas en consultas individuales por día
    * Estrategia: Hacer una consulta por cada día del rango (from=to=día) y luego unir resultados
    * Esto evita el límite de 50 issues y garantiza que obtengamos todos los issues
    */
+  /** Límite de issues por request de la API Jira (sin paginación) */
+  private static readonly JIRA_SEARCH_MAX_RESULTS = 50;
+
+  /**
+   * Días extra al buscar issues por rango (hacia atrás y hacia adelante).
+   * Jira filtra worklogDate por fecha de CREACIÓN del worklog; nosotros mostramos por STARTED (fecha trabajada).
+   * Si alguien trabaja el 26 pero carga las horas el 27, el issue solo sale en worklogDate=27.
+   * Ampliando la búsqueda capturamos esos issues; luego filtramos worklogs por started en [from, to].
+   */
+  private static readonly WORKLOG_DATE_RANGE_LOOKBACK_DAYS = 7;
+
   private async getIssuesWithDateRangeSplit(
     baseJql: string | undefined,
     from: string,
@@ -329,24 +330,21 @@ export class JiraService {
     const allIssues: JiraIssue[] = [];
     const uniqueIssueKeys = new Set<string>();
 
-    // Convertir fechas a objetos Date para iterar día por día
-    const fromDate = new Date(from);
-    const toDate = new Date(to);
-    const currentDate = new Date(fromDate);
+    // Ampliar rango: (from - 7) hasta (to + 7) para capturar worklogs "created" antes/después pero "started" en [from, to]
+    const effectiveFrom = this.subtractDays(from, JiraService.WORKLOG_DATE_RANGE_LOOKBACK_DAYS);
+    const effectiveTo = this.addDays(to, JiraService.WORKLOG_DATE_RANGE_LOOKBACK_DAYS);
+    let dateStr = effectiveFrom;
+    const daysQueried: string[] = [];
+    const issuesPerDay: Record<string, number> = {};
 
-    // Iterar día por día desde 'from' hasta 'to' (inclusive)
-    while (currentDate <= toDate) {
-      const dateStr = currentDate.toISOString().split('T')[0]; // YYYY-MM-DD
+    while (dateStr <= effectiveTo) {
+      daysQueried.push(dateStr);
 
-      // Construir JQL para este día específico (from=to=mismo día)
-      // Usamos expandWorklogDateRange=false para no expandir el rango
-      // Pasamos username para filtrar directamente en el JQL
       const jql = this.buildJql(baseJql, dateStr, dateStr, projectKey, false, username);
-
-      // Obtener issues de este día
       const issues = await this.getIssues(jql, accessToken, cloudId);
 
-      // Agregar solo issues únicos (por key) para evitar duplicados
+      issuesPerDay[dateStr] = issues.length;
+
       for (const issue of issues) {
         if (!uniqueIssueKeys.has(issue.key)) {
           uniqueIssueKeys.add(issue.key);
@@ -354,17 +352,24 @@ export class JiraService {
         }
       }
 
-      // Avanzar al día siguiente
-      currentDate.setDate(currentDate.getDate() + 1);
+      if (dateStr === effectiveTo) break;
+      dateStr = this.nextDay(dateStr);
+    }
+
+    // Debug: resumen para entender por qué faltan worklogs según el rango
+    const daysAtLimit = daysQueried.filter((d) => issuesPerDay[d] >= JiraService.JIRA_SEARCH_MAX_RESULTS);
+    if (daysAtLimit.length > 0) {
+      console.error(
+        `[getIssuesWithDateRangeSplit] Rango ${from}→${to}: ${allIssues.length} issues únicos. Días que devolvieron el límite (${JiraService.JIRA_SEARCH_MAX_RESULTS}): [${daysAtLimit.join(', ')}]. Si un worklog está en uno de esos días pero el issue no entró en los primeros 50, no aparecerá.`,
+      );
     }
 
     return allIssues;
   }
 
   /**
-   * Filtra un worklog por rango de fechas
-   * IMPORTANTE: Compara solo la fecha local del worklog, no la fecha UTC
-   * para evitar problemas de timezone
+   * Filtra un worklog por la fecha en que se trabajaron las horas (started),
+   * no por la fecha en que se cargaron en Jira (created).
    */
   private isWorklogInDateRange(worklog: JiraWorklog, from?: string, to?: string): boolean {
     if (!from && !to) return true;
@@ -372,9 +377,6 @@ export class JiraService {
     const worklogDate = worklog.started;
     if (!worklogDate) return false;
 
-    // Extraer la fecha local del string ISO (YYYY-MM-DD parte)
-    // El formato es: "2026-01-15T18:55:00.000-0600" o "2026-01-15T18:55:00.000Z"
-    // Extraemos solo la parte de la fecha antes de la 'T'
     const dateStr = worklogDate.split('T')[0]; // YYYY-MM-DD
 
     if (from && dateStr < from) return false;
@@ -409,13 +411,10 @@ export class JiraService {
     // Obtener cloudId del usuario
     const cloudId = await this.getCloudId(accessToken);
 
-    // Obtener issues usando estrategia de búsqueda dividida si hay fechas
-    // Divide el rango en sub-rangos para evitar el límite de 50 issues por request
-    // Esto es necesario porque POST /search/jql NO soporta paginación
+    // Con rango de fechas: dividimos por día porque /search/jql no soporta paginación (máx ~50 por request)
     let issues: JiraIssue[];
     if (from && to) {
       issues = await this.getIssuesWithDateRangeSplit(baseJql, from, to, projectKey, accessToken, cloudId, username);
-      console.log(`[getHoursByUser] Issues obtenidos: ${JSON.stringify(issues)}`);
     } else {
       // Si no hay fechas, hacer búsqueda normal (solo primeros 50)
       // Pasamos username para filtrar directamente en el JQL
@@ -460,6 +459,15 @@ export class JiraService {
       }
     }
 
+    // Debug: lo que trae Jira (sin filtrar) — fechas "started" = día trabajado
+    const jiraRaw: Array<{ issue: string; worklogs: Array<{ started: string; created?: string }> }> = [];
+    for (const issue of issues) {
+      const wl = worklogsByIssue.get(issue.key) || [];
+      jiraRaw.push({
+        issue: issue.key,
+        worklogs: wl.map((w) => ({ started: w.started ?? '-', created: w.created })),
+      });
+    }
     // Agrupar worklogs por usuario y por issue
     const worklogsByUser: Record<
       string,
@@ -471,36 +479,21 @@ export class JiraService {
 
     for (const issue of issues) {
       const worklogs = worklogsByIssue.get(issue.key) || [];
-      console.log(`[getHoursByUser] Procesando issue ${issue.key}: ${worklogs.length} worklogs encontrados`);
 
       for (const w of worklogs) {
-        // Filtrar worklogs por fecha
+        // Filtrar por fecha en que se trabajaron las horas (started)
         if (!this.isWorklogInDateRange(w, from, to)) {
-          console.log(`[getHoursByUser] Worklog del ${w.started} filtrado por fecha (from=${from}, to=${to})`);
           continue;
         }
 
-        // Usar emailAddress del autor (o displayName como fallback)
         const authorEmail = w.author.emailAddress || w.author.displayName;
-
-        // Skip si no hay identificador de autor
         if (!authorEmail) {
-          console.log(
-            `[getHoursByUser] Worklog sin identificador de autor: accountId=${w.author.accountId}, email=${w.author.emailAddress}, displayName=${w.author.displayName}`,
-          );
           continue;
         }
 
         if (username && w.author.accountId !== username) {
-          console.log(
-            `[getHoursByUser] Worklog filtrado por usuario: accountId=${w.author.accountId}, username buscado=${username}`,
-          );
           continue;
         }
-
-        console.log(
-          `[getHoursByUser] Worklog válido: issue=${issue.key}, author=${authorEmail}, date=${w.started}, seconds=${w.timeSpentSeconds}`,
-        );
 
         const seconds = w.timeSpentSeconds;
 
